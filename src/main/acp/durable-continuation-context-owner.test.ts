@@ -11,6 +11,7 @@ import {
 } from '../../shared/conversation-graph'
 import { applyRuntimeSessionEvents } from '../../shared/runtime-session-projection'
 import { normalizeSessionFile } from '../../shared/session-persistence'
+import type { ElicitationProjection } from '../../shared/elicitation'
 import type {
   PersistedChatMessage,
   PersistedChatSession,
@@ -21,6 +22,7 @@ import { SessionPersistenceStateOwner } from '../session-persistence/state-owner
 import { loadSessionMutationAuthority, SessionRepository } from '../session-persistence/repository'
 import { initDataRoot } from '../storage-root'
 import { AcpDurableContinuationContextOwner } from './durable-continuation-context-owner'
+import { AcpElicitationOwner } from './elicitation-owner'
 
 const message = (
   id: string,
@@ -390,6 +392,104 @@ describe('AcpDurableContinuationContextOwner', () => {
     await expect(createOwner(reloaded).prepareElicitation(answer)).resolves.toMatchObject({
       request: { requestId: 'choice-1' }
     })
+  })
+
+  it('leaves an orphaned card when the notification fails after publishing', async () => {
+    const initial = createSession([message('prompt-active', 'Choose an approach.')])
+    initial.runtimeTranscriptOwner = 'main'
+    initial.status = 'running'
+    initial.activeRun = { promptMessageId: 'prompt-active', startedAt: 1 }
+    const graph = initial.conversationGraph!
+    const scope = {
+      promptMessageId: 'prompt-active',
+      agentFrameId: graph.rootFrameId,
+      messageBranchId: graph.branches[0].id,
+      runtimeSegmentId: graph.runtimeSegments[0].id
+    }
+
+    // Publishing the question reaches the renderer, then the notification itself fails. The live
+    // wait is dropped (the agent is told the question was cancelled) while the card event was
+    // already emitted.
+    let published: ElicitationProjection | undefined
+    const elicitationOwner = new AcpElicitationOwner({
+      onProjection: (_request, projection) => {
+        published = projection
+        throw new Error('Renderer is not reachable.')
+      }
+    })
+    const question = elicitationOwner.requestDetached(
+      {
+        mode: 'form',
+        sessionId: initial.id,
+        toolCallId: 'tool-choice-1',
+        message: 'Choose an approach',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            question_0: {
+              type: 'string',
+              oneOf: [
+                { const: 'Minimal', title: 'Minimal' },
+                { const: 'Expanded', title: 'Expanded' }
+              ]
+            }
+          }
+        }
+      },
+      { sessionId: initial.id },
+      {
+        kind: 'agent-user-choice',
+        requestId: 'choice-1',
+        promptMessageId: 'prompt-active'
+      }
+    )
+    expect(question).toBeUndefined()
+    expect(elicitationOwner.getPendingRequests()).toEqual([])
+    if (!published) throw new Error('The question card was not published.')
+    expect(published).toMatchObject({
+      state: 'pending',
+      durable: { requestId: 'choice-1', promptMessageId: 'prompt-active' }
+    })
+
+    // The emitted card event reaches the Session only after the provider stop committed, so the
+    // terminal write parks nothing and the late card settles a pending question on an idle Session.
+    const stopped = applyRuntimeSessionEvents(initial, scope, [
+      {
+        id: 'stop-event',
+        timestamp: 2,
+        sessionId: initial.id,
+        promptMessageId: scope.promptMessageId,
+        kind: 'stop' as const,
+        level: 'info' as const,
+        text: 'end_turn'
+      }
+    ])
+    const projected = applyRuntimeSessionEvents(stopped, scope, [
+      {
+        id: 'orphan-question-event',
+        timestamp: 3,
+        sessionId: initial.id,
+        promptMessageId: scope.promptMessageId,
+        kind: 'tool' as const,
+        level: 'info' as const,
+        toolCallId: 'tool-choice-1',
+        title: 'Choose an approach',
+        status: 'in_progress',
+        elicitation: published
+      }
+    ])
+    expect(projected.status).toBe('idle')
+    expect(projected.activities?.[0].elicitation?.state).toBe('pending')
+    await expect(
+      createOwner(projected).prepareElicitation({
+        projectId: projected.projectId,
+        sessionId: projected.id,
+        requestId: 'choice-1',
+        toolCallId: 'tool-choice-1',
+        action: 'accept',
+        answers: [{ fieldId: 'question_0', value: 'Expanded' }]
+      })
+    ).rejects.toThrow('Durable elicitation no longer matches the pending Session activity.')
   })
 
   it('keeps a live provider run intact when decoding a pending question', () => {
