@@ -544,3 +544,82 @@ test('cancels an active provider turn on ordinary quit and resumes it after rest
     )
     .toBe('idle')
 })
+
+// The durable app-owned question returns `pending` instead of blocking, so the provider turn ends
+// immediately. Main must still park the Session on the recorded elicitation; otherwise the card
+// outlives the wait and its response fails the durable authority check.
+test('parks the Session when an app-owned question ends its turn', async ({ app }, testInfo) => {
+  test.setTimeout(120_000)
+  await app.completeOnboarding()
+  const page = await app.configureFakeAgent()
+  await createProjectViaUi(page, 'Question turn parking')
+  await submitPromptViaUi(page, 'Ask the resume race question.')
+  const composer = page.getByTestId('elicitation-composer')
+  await expect(composer).toBeVisible()
+  const readSession = async (): Promise<PersistedChatSession> =>
+    page.evaluate(async () => (await window.api.sessions.loadAll()).sessions[0])
+  await expect.poll(async () => (await readSession()).status).not.toBe('running')
+  const parked = await readSession()
+  await testInfo.attach('session-after-question', {
+    body: JSON.stringify(parked, null, 2),
+    contentType: 'application/json'
+  })
+  expect(parked.status).toBe('waiting-for-user')
+  expect(
+    parked.activities?.filter((activity) => activity.elicitation?.state === 'pending')
+  ).toHaveLength(1)
+})
+
+// Regression journey for a crash while the answer continuation runs: the restart resumes the
+// interrupted turn and asks the durable question again. The Session must park on that new question;
+// a pending card with an idle Session makes every answer fail with "Durable elicitation no longer
+// matches the pending Session activity."
+test('keeps a re-asked question answerable after a crash during the answer continuation', async ({
+  app
+}, testInfo) => {
+  test.setTimeout(240_000)
+  await app.completeOnboarding()
+  let page = await app.configureFakeAgent()
+  await createProjectViaUi(page, 'Question continuation crash')
+  const prompt = 'Ask the resume race question.'
+  await submitPromptViaUi(page, prompt)
+  let composer = page.getByTestId('elicitation-composer')
+  await expect(composer).toBeVisible()
+  await composer.getByText('Dataset Alpha', { exact: true }).first().click()
+  await composer.getByRole('button', { name: 'Finish', exact: true }).click()
+
+  // The fixture holds the continuation open, so the process is killed while the turn is running.
+  await expect(page.getByText('Resume race hold 2.', { exact: false })).toBeVisible({
+    timeout: 30_000
+  })
+  page = await app.restartAfterCrash({ force: true })
+  await page
+    .getByRole('region', { name: 'Recent sessions' })
+    .getByRole('button', { name: prompt })
+    .click()
+  const resume = page.getByRole('button', { name: 'Resume session', exact: true })
+  await expect(resume).toBeVisible()
+  await resume.click()
+
+  // The recovery replay asks the question again: this is a new durable elicitation, not the card
+  // the user already answered before the crash.
+  composer = page.getByTestId('elicitation-composer')
+  await expect(composer).toBeVisible({ timeout: 60_000 })
+  const readSession = async (): Promise<PersistedChatSession> =>
+    page.evaluate(async () => (await window.api.sessions.loadAll()).sessions[0])
+  await expect
+    .poll(async () => (await readSession()).status, { timeout: 30_000 })
+    .not.toBe('running')
+  const parked = await readSession()
+  await testInfo.attach('session-after-resumed-question', {
+    body: JSON.stringify(parked, null, 2),
+    contentType: 'application/json'
+  })
+  expect(parked.status).toBe('waiting-for-user')
+  await composer.getByText('Dataset Alpha', { exact: true }).first().click()
+  await composer.getByRole('button', { name: 'Finish', exact: true }).click()
+  await expect(composer.getByRole('alert')).toHaveCount(0)
+  await expect(page.getByText('Resume race: continuation finished.', { exact: false })).toBeVisible(
+    { timeout: 40_000 }
+  )
+})

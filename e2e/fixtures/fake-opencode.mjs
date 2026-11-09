@@ -101,6 +101,8 @@ const RELIABLE_FAILURE_PROMPT = 'Start the reliable messaging post-fence failure
 const RELIABLE_FAILURE_OBSERVE_PROMPT = 'Observe the reliable messaging post-fence failure.'
 const RELIABLE_FAIRNESS_PROMPT = 'Start the reliable messaging fairness journey.'
 const LONG_STREAM_PROMPT = 'Stream the long scroll journey.'
+const ASK_USER_RESUME_RACE_PROMPT = 'Ask the resume race question.'
+const ASK_USER_RESUME_RACE_QUESTION = 'Resume race dataset?'
 const RUNTIME_RESOURCE_STRESS_PROMPT = 'Run the runtime resource stress journey.'
 const MARKDOWN_PARSER_PROMPT = 'Run the native Markdown parser journey.'
 const QUEUE_GATE_PROMPT = 'Hold the queue until the reveal finishes.'
@@ -373,6 +375,26 @@ const withMcpClient = async (sessionId, serverName, operation) => {
     await recordMutationStage('mcp-closed')
   }
 }
+
+// A durable app-owned question. The tool returns `pending` instead of blocking, so the provider
+// turn ends and Main must park the Session on the recorded elicitation.
+const askResumeRaceQuestion = async (context) =>
+  withMcpClient(context.params.sessionId, 'open-science-notebook', async (client) =>
+    toolResult(
+      'ask_user_question',
+      await client.callTool({
+        name: 'ask_user_question',
+        arguments: {
+          questions: [
+            {
+              question: ASK_USER_RESUME_RACE_QUESTION,
+              options: [{ label: 'Dataset Alpha' }, { label: 'Dataset Beta' }]
+            }
+          ]
+        }
+      })
+    )
+  )
 
 // Deterministic provider; discovery, binding admission and Python/R execution remain production code.
 const verifyRuntimeApproval = async (context, prompt) =>
@@ -2066,6 +2088,36 @@ if (process.argv.includes('--version')) {
           prompt.includes('The user provided review feedback for the pending Session Plan.')
         ) {
           reply = 'Restart verification: Plan feedback delivered.'
+        } else if (
+          prompt.includes('Continue the interrupted turn from where it stopped.') &&
+          (prompt.includes(ASK_USER_RESUME_RACE_PROMPT) ||
+            prompt.includes('Resume race: waiting for the answer.'))
+        ) {
+          // Resume after a crash during the answer continuation. Ask the durable question again
+          // so the resumed turn owns a fresh pending elicitation instead of a restored card.
+          await askResumeRaceQuestion(context)
+          reply = 'Resume race: waiting for the answer.'
+        } else if (
+          prompt.includes('The user responded to the pending questions:') &&
+          prompt.includes(ASK_USER_RESUME_RACE_QUESTION)
+        ) {
+          // Hold the continuation open so the journey can kill the application mid-turn.
+          const holdMessageId = `e2e-message-${fixtureInstanceId}${nextMessageId++}`
+          for (let index = 0; index < 40; index += 1) {
+            await context.client.notify(acp.methods.client.session.update, {
+              sessionId: context.params.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                messageId: holdMessageId,
+                content: { type: 'text', text: `Resume race hold ${index}.\n\n` }
+              }
+            })
+            await delay(250)
+          }
+          reply = 'Resume race: continuation finished.'
+        } else if (prompt.includes(ASK_USER_RESUME_RACE_PROMPT)) {
+          await askResumeRaceQuestion(context)
+          reply = 'Resume race: waiting for the answer.'
         } else if (
           prompt.includes(
             'The user answered the pending question: Restart verification dataset?'
