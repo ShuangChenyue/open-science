@@ -326,6 +326,72 @@ describe('AcpDurableContinuationContextOwner', () => {
     }
   )
 
+  it('rejects a question whose projection landed after the turn already ended', async () => {
+    const initial = createSession([message('prompt-active', 'Choose an approach.')])
+    initial.runtimeTranscriptOwner = 'main'
+    initial.status = 'running'
+    initial.activeRun = { promptMessageId: 'prompt-active', startedAt: 1 }
+    const graph = initial.conversationGraph!
+    const scope = {
+      promptMessageId: 'prompt-active',
+      agentFrameId: graph.rootFrameId,
+      messageBranchId: graph.branches[0].id,
+      runtimeSegmentId: graph.runtimeSegments[0].id
+    }
+    // The provider stop commits before the app-owned question projection reaches the Session.
+    // The terminal write parks nothing, so the Session falls back to its settled state.
+    const stopped = applyRuntimeSessionEvents(initial, scope, [
+      {
+        id: 'stop-event',
+        timestamp: 2,
+        sessionId: initial.id,
+        promptMessageId: scope.promptMessageId,
+        kind: 'stop' as const,
+        level: 'info' as const,
+        text: 'end_turn'
+      }
+    ])
+    const projected = applyRuntimeSessionEvents(stopped, scope, [
+      {
+        id: 'late-question-event',
+        timestamp: 3,
+        sessionId: initial.id,
+        promptMessageId: scope.promptMessageId,
+        kind: 'tool' as const,
+        level: 'info' as const,
+        toolCallId: 'tool-choice-1',
+        title: 'Choose an approach',
+        status: 'in_progress',
+        elicitation: pendingChoice().elicitation
+      }
+    ])
+    expect(projected.status).toBe('idle')
+    expect(projected.activities?.[0]).toMatchObject({
+      id: 'tool-choice-1',
+      elicitation: { state: 'pending', durable: { requestId: 'choice-1' } }
+    })
+
+    const answer = {
+      projectId: projected.projectId,
+      sessionId: projected.id,
+      requestId: 'choice-1',
+      toolCallId: 'tool-choice-1',
+      action: 'accept' as const,
+      answers: [{ fieldId: 'question_0', value: 'Expanded' }]
+    }
+    // The durable authority refuses to attach a human decision to a Session that no longer waits.
+    await expect(createOwner(projected).prepareElicitation(answer)).rejects.toThrow(
+      'Durable elicitation no longer matches the pending Session activity.'
+    )
+
+    // Reloading the file applies the decoder's validated wait, so the same decision is accepted.
+    const reloaded = normalizeSessionFile(JSON.parse(JSON.stringify(projected)))!
+    expect(reloaded.status).toBe('waiting-for-user')
+    await expect(createOwner(reloaded).prepareElicitation(answer)).resolves.toMatchObject({
+      request: { requestId: 'choice-1' }
+    })
+  })
+
   it('keeps a live provider run intact when decoding a pending question', () => {
     const session = createSession([message('prompt-active', 'Choose an approach.')])
     session.status = 'running'
